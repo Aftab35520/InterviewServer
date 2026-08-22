@@ -33,23 +33,36 @@ razorpay_client = razorpay.Client(
 )
 from agent.agent_call import agent_call
 
-# ── MongoDB (reuse auth module's connection) ─────────────────────────────────
-# Add parent dir so we can import auth.py from the root
-# Read MongoDB configuration from environment variables
-MONGO_URI = os.getenv("MONGODB_URI")  # or "MONGO_URI"
-DB_NAME   = os.getenv("MONGODB_DB_NAME", "interviewhelper")  # default fallback
-COLL      = os.getenv("MONGODB_COLLECTION", "users")  # default fallback
+# ── MongoDB ───────────────────────────────────────────────────────────────────
+MONGO_URI = os.getenv("MONGODB_URI")
+DB_NAME   = os.getenv("MONGODB_DB_NAME", "interviewhelper")
+COLL      = os.getenv("MONGODB_COLLECTION", "users")
+COUPONS_COLL = os.getenv("MONGODB_COUPONS_COLL", "coupons")
 
-try:
-    _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000,tlsAllowInvalidCertificates=True )
-    _db = _mongo_client[DB_NAME]
-    MONGO_AVAILABLE = True
-    print(f"[MongoDB] Connected successfully to database: {DB_NAME}")
-except Exception as _e:
-    print(f"[MongoDB] Connection failed: {_e}")
-    MONGO_AVAILABLE = False
-    _db = None
-    _mongo_client = None
+_mongo_client = None
+_db = None
+
+def _get_db():
+    global _mongo_client, _db
+    if _db is not None:
+        return _db
+    if not MONGO_URI:
+        return None
+    try:
+        _mongo_client = MongoClient(
+            MONGO_URI,
+            connect=False,
+            serverSelectionTimeoutMS=5000,
+            tlsAllowInvalidCertificates=True,
+        )
+        _db = _mongo_client[DB_NAME]
+        return _db
+    except Exception as _e:
+        print(f"[MongoDB] Connection failed: {_e}")
+        return None
+
+def is_mongo_available():
+    return _get_db() is not None
 
 app = Flask(__name__)
 CORS(app)
@@ -101,14 +114,252 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# ── Credit Purchase Page ──────────────────────────────────────────────────────
+# ── Google OAuth & Auth Endpoints (Secured on Backend) ────────────────────────
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+COUPONS_COLL = os.getenv("MONGODB_COUPONS_COLL", "coupons")
+
+
+@app.route("/api/auth/google", methods=["POST"])
+def auth_google():
+    """
+    Exchange authorization code for tokens, fetch Google user info,
+    upsert user in MongoDB with device_token, and return user document.
+    """
+    data = request.get_json(silent=True) or {}
+    code = data.get("code")
+    redirect_uri = data.get("redirect_uri", "http://localhost:8765")
+    device_token = data.get("device_token", "")
+
+    if not code:
+        return jsonify({"success": False, "message": "Missing authorization code"}), 400
+
+    try:
+        import requests as _req
+        token_resp = _req.post(_GOOGLE_TOKEN_URL, data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }, timeout=15)
+        token_data = token_resp.json()
+
+        if "error" in token_data:
+            return jsonify({
+                "success": False,
+                "message": f"Token exchange failed: {token_data.get('error_description', token_data['error'])}"
+            }), 400
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return jsonify({"success": False, "message": "No access token in response"}), 400
+
+        userinfo_resp = _req.get(
+            _GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        google_info = userinfo_resp.json()
+        if "error" in google_info or "id" not in google_info:
+            return jsonify({"success": False, "message": "Failed to fetch user profile from Google"}), 400
+
+        google_id = google_info["id"]
+        now = time.time()
+        
+        user_doc = {
+            "google_id": google_id,
+            "email": google_info.get("email", ""),
+            "name": google_info.get("name", ""),
+            "picture": google_info.get("picture", ""),
+            "current_device_token": device_token,
+            "profile": {},
+            "credit_seconds": 3600,
+        }
+
+        db = _get_db()
+        if db is not None:
+            update_doc = {
+                "$set": {
+                    "email": google_info.get("email", ""),
+                    "name": google_info.get("name", ""),
+                    "picture": google_info.get("picture", ""),
+                    "last_login": now,
+                    "current_device_token": device_token,
+                },
+                "$setOnInsert": {
+                    "google_id": google_id,
+                    "profile": {},
+                    "credit_seconds": 3600,
+                    "created_at": now,
+                }
+            }
+            db[COLL].update_one({"google_id": google_id}, update_doc, upsert=True)
+            db_user = db[COLL].find_one({"google_id": google_id}, {"_id": 0})
+            if db_user:
+                user_doc = db_user
+
+        return jsonify({"success": True, "user": user_doc})
+
+    except Exception as e:
+        print(f"[Auth] Google auth error: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/auth/validate-session", methods=["POST"])
+def validate_session_endpoint():
+    """
+    Validate local session token against MongoDB to enforce single-device login.
+    """
+    data = request.get_json(silent=True) or {}
+    google_id = data.get("google_id")
+    device_token = data.get("device_token", "")
+
+    if not google_id:
+        return jsonify({"status": "not_found", "message": "Missing google_id"}), 400
+
+    db = _get_db()
+    if db is None:
+        return jsonify({"status": "db_error", "message": "Database unavailable"})
+
+    try:
+        user = db[COLL].find_one({"google_id": google_id}, {"_id": 0})
+        if not user:
+            return jsonify({"status": "not_found", "message": "User not found"})
+
+        db_token = user.get("current_device_token", "")
+        if device_token and db_token and db_token != device_token:
+            return jsonify({"status": "kicked", "message": "Logged in on another device"})
+
+        return jsonify({"status": "valid", "user": user})
+    except Exception as e:
+        print(f"[Auth] validate_session error: {e}")
+        return jsonify({"status": "db_error", "message": str(e)})
+
+
+@app.route("/api/user/profile/<google_id>", methods=["GET"])
+def get_user_profile(google_id):
+    """Retrieve user profile & credit from MongoDB."""
+    db = _get_db()
+    if db is None:
+        return jsonify({"success": False, "message": "DB not available"}), 503
+    try:
+        user = db[COLL].find_one({"google_id": google_id}, {"_id": 0})
+        if user:
+            return jsonify({
+                "success": True,
+                "profile": user.get("profile", {}),
+                "credit_seconds": int(user.get("credit_seconds", 0))
+            })
+        return jsonify({"success": False, "message": "User not found"}), 404
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/user/profile", methods=["POST"])
+def save_user_profile():
+    """Save user profile to MongoDB."""
+    data = request.get_json(silent=True) or {}
+    google_id = data.get("google_id")
+    profile = data.get("profile", {})
+
+    if not google_id:
+        return jsonify({"success": False, "message": "Missing google_id"}), 400
+
+    db = _get_db()
+    if db is None:
+        return jsonify({"success": False, "message": "DB not available"}), 503
+
+    try:
+        db[COLL].update_one({"google_id": google_id}, {"$set": {"profile": profile}}, upsert=True)
+        return jsonify({"success": True, "message": "Profile saved"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/user/credits/<google_id>", methods=["GET"])
+def get_credits_endpoint(google_id):
+    """Get remaining credit seconds for a user."""
+    seconds = _get_credit_seconds(google_id)
+    return jsonify({"success": True, "credit_seconds": seconds})
+
+
+@app.route("/api/user/credits/sync", methods=["POST"])
+def sync_credits_endpoint():
+    """Persist credit seconds to MongoDB."""
+    data = request.get_json(silent=True) or {}
+    google_id = data.get("google_id")
+    seconds = data.get("credit_seconds")
+
+    if not google_id or seconds is None:
+        return jsonify({"success": False, "message": "Missing google_id or credit_seconds"}), 400
+
+    db = _get_db()
+    if db is None:
+        return jsonify({"success": False, "message": "DB not available"}), 503
+
+    try:
+        db[COLL].update_one({"google_id": google_id}, {"$set": {"credit_seconds": max(0, int(seconds))}}, upsert=True)
+        return jsonify({"success": True, "credit_seconds": seconds})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/user/redeem-coupon", methods=["POST"])
+def redeem_coupon_endpoint():
+    """Atomic single-use coupon redemption."""
+    data = request.get_json(silent=True) or {}
+    google_id = data.get("google_id")
+    code = (data.get("code") or "").strip().upper()
+
+    if not google_id or not code:
+        return jsonify({"success": False, "message": "Missing google_id or coupon code"}), 400
+
+    db = _get_db()
+    if db is None:
+        return jsonify({"success": False, "message": "Database not reachable"}), 503
+
+    try:
+        coupon = db[COUPONS_COLL].find_one_and_update(
+            {"code": code, "used": False},
+            {"$set": {"used": True, "redeemed_by": google_id, "redeemed_at": time.time()}},
+            return_document=False
+        )
+        if not coupon:
+            exists = db[COUPONS_COLL].find_one({"code": code})
+            if exists:
+                return jsonify({"success": False, "message": "This coupon has already been used."}), 400
+            return jsonify({"success": False, "message": "Invalid coupon code."}), 400
+
+        minutes = int(coupon.get("minutes", 0))
+        if minutes <= 0:
+            return jsonify({"success": False, "message": "Coupon has no time attached."}), 400
+
+        added_seconds = minutes * 60
+        db[COLL].update_one({"google_id": google_id}, {"$inc": {"credit_seconds": added_seconds}}, upsert=True)
+        user = db[COLL].find_one({"google_id": google_id}, {"credit_seconds": 1})
+        new_total = int((user or {}).get("credit_seconds", added_seconds))
+
+        return jsonify({
+            "success": True,
+            "message": f"Added {minutes} minutes! Total: {new_total // 60} min {new_total % 60:02d} sec",
+            "credit_seconds": new_total
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Redemption failed: {e}"}), 500
+
+
+# ── Credit Helpers ────────────────────────────────────────────────────────────
 
 def _get_credit_seconds(google_id: str) -> int:
     """Read current credit from MongoDB."""
-    if not MONGO_AVAILABLE or _db is None or not google_id:
+    db = _get_db()
+    if db is None or not google_id:
         return 0
     try:
-        user = _db[COLL].find_one({"google_id": google_id}, {"credit_seconds": 1})
+        user = db[COLL].find_one({"google_id": google_id}, {"credit_seconds": 1})
         return int((user or {}).get("credit_seconds", 0))
     except Exception:
         return 0
@@ -116,10 +367,11 @@ def _get_credit_seconds(google_id: str) -> int:
 
 def _add_credit_seconds(google_id: str, amount: int) -> int:
     """Atomically increment credit and return the new total."""
-    if not MONGO_AVAILABLE or _db is None or not google_id:
+    db = _get_db()
+    if db is None or not google_id:
         return 0
     try:
-        result = _db[COLL].find_one_and_update(
+        result = db[COLL].find_one_and_update(
             {"google_id": google_id},
             {"$inc": {"credit_seconds": amount}},
             return_document=True,
@@ -130,8 +382,6 @@ def _add_credit_seconds(google_id: str, amount: int) -> int:
         print(f"[Buy] add_credit_seconds error: {e}")
         return 0
 
-import time
-from flask import jsonify
 
 
 @app.route("/create-order/<user_id>", methods=["GET"])
@@ -151,7 +401,8 @@ def Create_razorpay_order(user_id):
     # Check database
     # -----------------------------------------
 
-    if not MONGO_AVAILABLE or _db is None:
+    db = _get_db()
+    if db is None:
         return jsonify({
             "success": False,
             "message": "Database unavailable"
@@ -161,7 +412,7 @@ def Create_razorpay_order(user_id):
     # Find user
     # -----------------------------------------
 
-    user = _db[COLL].find_one({
+    user = db[COLL].find_one({
         "google_id": str(user_id)
     })
 
@@ -248,7 +499,7 @@ def Create_razorpay_order(user_id):
             "paid_at": None
         }
 
-        _db["payments"].insert_one(payment)
+        db["payments"].insert_one(payment)
 
     except Exception as e:
 
@@ -337,7 +588,8 @@ def Verify_razorpay_payment():
     # Database check
     # =========================================
 
-    if not MONGO_AVAILABLE or _db is None:
+    db = _get_db()
+    if db is None:
         return jsonify({
             "success": False,
             "message": "Database unavailable"
@@ -347,7 +599,7 @@ def Verify_razorpay_payment():
     # Find our payment record
     # =========================================
 
-    payment = _db["payments"].find_one({
+    payment = db["payments"].find_one({
         "razorpay_order_id": razorpay_order_id
     })
 
@@ -420,7 +672,7 @@ def Verify_razorpay_payment():
     # Find user
     # =========================================
 
-    user = _db[COLL].find_one({
+    user = db[COLL].find_one({
         "google_id": str(google_id)
     })
 
@@ -435,7 +687,7 @@ def Verify_razorpay_payment():
     # Update payment
     # =========================================
 
-    payment_update = _db["payments"].update_one(
+    payment_update = db["payments"].update_one(
 
         {
             "_id": payment["_id"],
@@ -467,7 +719,7 @@ def Verify_razorpay_payment():
     if payment_update.modified_count != 1:
 
         # Another request may have processed it
-        latest_payment = _db["payments"].find_one({
+        latest_payment = db["payments"].find_one({
             "_id": payment["_id"]
         })
 
@@ -494,7 +746,7 @@ def Verify_razorpay_payment():
         3600
     )
 
-    _db[COLL].update_one(
+    db[COLL].update_one(
 
         {
             "google_id": str(google_id)
@@ -674,7 +926,11 @@ def razorpay_webhook():
             # Find our payment
             # -----------------------------------------
 
-            payment = _db["payments"].find_one({
+            db = _get_db()
+            if db is None:
+                return jsonify({"success": False, "message": "Database not reachable"}), 503
+
+            payment = db["payments"].find_one({
                 "razorpay_order_id":
                     razorpay_order_id
             })
@@ -771,7 +1027,7 @@ def razorpay_webhook():
             # This prevents duplicate credit.
             # -----------------------------------------
 
-            payment_update = _db["payments"].update_one(
+            payment_update = db["payments"].update_one(
 
                 {
                     "_id": payment["_id"],
@@ -823,7 +1079,7 @@ def razorpay_webhook():
                 3600
             )
 
-            _db[COLL].update_one(
+            db[COLL].update_one(
 
                 {
                     "google_id":
@@ -881,31 +1137,33 @@ def razorpay_webhook():
 
             if razorpay_order_id:
 
-                _db["payments"].update_one(
+                db = _get_db()
+                if db is not None:
+                    db["payments"].update_one(
 
-                    {
-                        "razorpay_order_id":
-                            razorpay_order_id,
+                        {
+                            "razorpay_order_id":
+                                razorpay_order_id,
 
-                        "status": {
-                            "$ne": "paid"
+                            "status": {
+                                "$ne": "paid"
+                            }
+                        },
+
+                        {
+                            "$set": {
+
+                                "razorpay_payment_id":
+                                    razorpay_payment_id,
+
+                                "status":
+                                    "failed",
+
+                                "failed_at":
+                                    time.time()
+                            }
                         }
-                    },
-
-                    {
-                        "$set": {
-
-                            "razorpay_payment_id":
-                                razorpay_payment_id,
-
-                            "status":
-                                "failed",
-
-                            "failed_at":
-                                time.time()
-                        }
-                    }
-                )
+                    )
 
         except Exception as e:
 
