@@ -68,10 +68,16 @@ app = Flask(__name__)
 CORS(app)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "interview-helper-secret")
 
+# ── App Version Management ───────────────────────────────────────────────────
+MIN_APP_VERSION    = os.getenv("MIN_APP_VERSION", "1.0.0")
+LATEST_APP_VERSION = os.getenv("LATEST_APP_VERSION", "1.0.0")
+APP_DOWNLOAD_URL   = os.getenv("APP_DOWNLOAD_URL", "https://www.aftaro.com/download")
+INITIAL_FREE_CREDIT_SECONDS = int(os.getenv("INITIAL_FREE_CREDIT_SECONDS", "1200"))  # 20 minutes for new users
+
 # ── Rate limiter ─────────────────────────────────────────────────────────────
-# Sliding-window: 15 requests per 60 seconds, per connected client (sid).
-RATE_LIMIT        = 15      # max requests
-RATE_WINDOW_SEC   = 60      # rolling window in seconds
+# Sliding-window: 10 requests per 60 seconds (configurable), per connected client (sid).
+RATE_LIMIT        = int(os.getenv("RATE_LIMIT", "10"))  # max requests per window
+RATE_WINDOW_SEC   = int(os.getenv("RATE_WINDOW_SEC", "60"))  # rolling window in seconds
 _rate_lock        = threading.Lock()
 _rate_buckets: dict[str, deque] = {}  # sid -> deque of request timestamps
 
@@ -104,14 +110,52 @@ socketio = SocketIO(
 
 # ── REST endpoints ───────────────────────────────────────────────────────────
 
+def _parse_version(v_str: str) -> tuple:
+    """Safely parse version string like '1.0.0' into numeric tuple (1, 0, 0)."""
+    try:
+        parts = [int(p) for p in v_str.strip().split(".") if p.isdigit()]
+        return tuple(parts) if parts else (0, 0, 0)
+    except Exception:
+        return (0, 0, 0)
+
+
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "message": "Interview Helper server running"})
+    return jsonify({
+        "status": "ok",
+        "app": "Aftaro Backend",
+        "min_version": MIN_APP_VERSION,
+        "latest_version": LATEST_APP_VERSION,
+    })
 
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/version", methods=["GET"])
+def check_version():
+    """
+    Client passes ?version=1.0.0.
+    Returns whether update is required (force_update) and latest version info.
+    """
+    client_version_str = request.args.get("version", "").strip()
+    force_update = False
+    if client_version_str:
+        client_ver = _parse_version(client_version_str)
+        min_ver = _parse_version(MIN_APP_VERSION)
+        if client_ver < min_ver:
+            force_update = True
+
+    return jsonify({
+        "success": True,
+        "min_version": MIN_APP_VERSION,
+        "latest_version": LATEST_APP_VERSION,
+        "download_url": APP_DOWNLOAD_URL,
+        "force_update": force_update,
+        "message": "Update required to continue using Aftaro." if force_update else "App version is up to date.",
+    })
 
 
 # ── Google OAuth & Auth Endpoints (Secured on Backend) ────────────────────────
@@ -176,7 +220,7 @@ def auth_google():
             "picture": google_info.get("picture", ""),
             "current_device_token": device_token,
             "profile": {},
-            "credit_seconds": 3600,
+            "credit_seconds": INITIAL_FREE_CREDIT_SECONDS,
         }
 
         db = _get_db()
@@ -192,7 +236,7 @@ def auth_google():
                 "$setOnInsert": {
                     "google_id": google_id,
                     "profile": {},
-                    "credit_seconds": 3600,
+                    "credit_seconds": INITIAL_FREE_CREDIT_SECONDS,
                     "created_at": now,
                 }
             }
@@ -1232,13 +1276,38 @@ def on_query(data):
     Emits:    response_done   -> { "message": "stream complete" }
     Emits:    response_error  -> { "error": "<message>" }
     """
-    sid        = request.sid
-    data       = data or {}
-    query_text = data.get("query", "").strip()
-    image_b64  = data.get("image", "")  # optional base64 PNG
+    sid          = request.sid
+    data         = data or {}
+    query_text   = data.get("query", "").strip()
+    image_b64    = data.get("image", "")  # optional base64 PNG
+    google_id    = data.get("google_id", "").strip()
+    device_token = data.get("device_token", "").strip()
+
     if not query_text:
         emit("response_error", {"error": "No query provided"})
         return
+
+    # ── Server-Side Auth & Credit Enforcement ────────────────────────────────
+    db = _get_db()
+    if db is not None:
+        if not google_id:
+            emit("response_error", {"error": "Authentication required. Please sign in with Google to use Aftaro."})
+            return
+
+        user = db[COLL].find_one({"google_id": google_id}, {"credit_seconds": 1, "current_device_token": 1})
+        if not user:
+            emit("response_error", {"error": "User account not found. Please sign in again."})
+            return
+
+        db_token = user.get("current_device_token", "")
+        if device_token and db_token and db_token != device_token:
+            emit("response_error", {"error": "Account is active on another device. Please sign in on this device."})
+            return
+
+        credit = int(user.get("credit_seconds", 0))
+        if credit <= 0:
+            emit("response_error", {"error": "Your interview credits have run out. Please buy credits to continue."})
+            return
 
     if not _check_rate_limit(sid):
         emit("response_error", {
@@ -1246,7 +1315,7 @@ def on_query(data):
         })
         return
 
-    print(f"[Q] sid={sid[:8]}…  {'[IMG] ' if image_b64 else ''}{query_text[:80]}")
+    print(f"[Q] sid={sid[:8]}… [User={google_id[:8]}…] {'[IMG] ' if image_b64 else ''}{query_text[:80]}")
     # Build HumanMessage — multimodal if an image was included
     if image_b64:
         message_content = [
