@@ -1,0 +1,30 @@
+# ── Web server ────────────────────────────────────────────────────────────────
+flask
+flask-cors
+flask-socketio
+gevent
+gevent-websocket
+gunicorn
+
+# ── LLM / AI ──────────────────────────────────────────────────────────────────
+langchain
+langchain-community
+langchain-openai
+langgraph
+openai
+
+# ── HTTP / SSL (truststore intentionally excluded — conflicts with gevent) ─────
+httpx
+httpx2
+certifi>=2024.7.4
+urllib3>=2.0.0
+requests>=2.31.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+pymongo
+
+# ── Payments ──────────────────────────────────────────────────────────────────
+razorpay
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv
