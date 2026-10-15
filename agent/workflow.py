@@ -100,7 +100,9 @@ def azure_Call(state: AgentState):
         ]
 
         response = llm.invoke(prompt_messages)
-        print(getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage"))
+        
+        usage = getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage")
+        response.content += f"\n\n[DEBUG TOKEN USAGE] {usage}"
         return {
             "messages": deletes + [response],
             "summary": new_summary,
@@ -121,7 +123,8 @@ def azure_Call(state: AgentState):
     prompt_messages.extend(messages)
 
     response = llm.invoke(prompt_messages)
-    print(getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage"))
+    usage = getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage")
+    response.content += f"\n\n[DEBUG TOKEN USAGE] {usage}"
     return {
         "messages": [response],
         "summary": summary,
