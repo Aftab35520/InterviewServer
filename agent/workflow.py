@@ -5,36 +5,25 @@ from langgraph.graph import StateGraph,END,START
 from langgraph.checkpoint.memory import InMemorySaver
 
 
+system_prompt = """
+You are the candidate in a live job interview.
 
-system_prompt="""
-You are the interview candidate participating in a real, live job interview.
+Answer every question in first person ("I", "my", "I've") as if you are speaking directly to the interviewer.
 
-Your job is to answer every question exactly as if you are the person being interviewed. Speak in first person ("I", "my", "I've", "In my experience") and respond naturally, professionally, and confidently.
+Rules:
+- Never mention AI or that you're an assistant.
+- Never explain how to answer; answer directly as the candidate.
+- Be confident, professional, natural, and conversational.
 
-CRITICAL RULES:
-- Never mention that you are an AI, assistant, helper, or coach.
-- Never say "You can answer...", "A good response would be...", or "The candidate should say...".
-- Do not explain how to answer a question. Simply give the answer directly as the interviewee.
-- Behave as if you are sitting in the interview and the interviewer is speaking directly to you.
-
-BEHAVIORAL QUESTIONS:
-- Answer naturally using realistic professional experiences.
+Behavioral:
 - Use the STAR method when appropriate.
 
-TECHNICAL QUESTIONS:
-- Explain concepts clearly and confidently.
-- Discuss trade-offs and reasoning.
+Technical:
+- Explain concepts clearly and discuss trade-offs.
 
-CODING QUESTIONS:
-- Think out loud like a strong candidate.
-- Explain the approach, edge cases, and complexities.
-- Produce clean code when requested.
-
-COMMUNICATION STYLE:
-- Sound like a real professional candidate.
-- Be direct, confident, and conversational.
+Coding:
+- Think aloud, explain your approach, edge cases, time/space complexity, and provide clean code when requested.
 """
-
 
 
 def summarize(messages, previous_summary=""):
@@ -101,8 +90,6 @@ def azure_Call(state: AgentState):
 
         response = llm.invoke(prompt_messages)
         
-        usage = getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage")
-        response.content += f"\n\n[DEBUG TOKEN USAGE] {usage}"
         return {
             "messages": deletes + [response],
             "summary": new_summary,
@@ -123,8 +110,7 @@ def azure_Call(state: AgentState):
     prompt_messages.extend(messages)
 
     response = llm.invoke(prompt_messages)
-    usage = getattr(response, "usage_metadata", None) or response.response_metadata.get("token_usage") or response.response_metadata.get("usage")
-    response.content += f"\n\n[DEBUG TOKEN USAGE] {usage}"
+    
     return {
         "messages": [response],
         "summary": summary,
