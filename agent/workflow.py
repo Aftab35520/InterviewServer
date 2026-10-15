@@ -89,7 +89,7 @@ def azure_Call(state: AgentState):
         ]
 
         response = llm.invoke(prompt_messages)
-        
+        print(f"In: {response.usage_metadata['input_tokens']} | Out: {response.usage_metadata['output_tokens']} | Total: {response.usage_metadata['total_tokens']}")
         return {
             "messages": deletes + [response],
             "summary": new_summary,
@@ -110,7 +110,7 @@ def azure_Call(state: AgentState):
     prompt_messages.extend(messages)
 
     response = llm.invoke(prompt_messages)
-    
+    print(f"In: {response.usage_metadata['input_tokens']} | Out: {response.usage_metadata['output_tokens']} | Total: {response.usage_metadata['total_tokens']}")
     return {
         "messages": [response],
         "summary": summary,
@@ -129,4 +129,5 @@ graph.add_edge("azure_Call",END)
 
 
 Graph_agent=graph.compile(checkpointer=memory)
+
 

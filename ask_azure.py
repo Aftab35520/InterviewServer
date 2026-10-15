@@ -27,6 +27,7 @@ llm = AzureChatOpenAI(
     azure_deployment=AZURE_DEPLOYMENT,
     api_version=AZURE_API_VER,
     streaming=True,
+    stream_usage=True,
     temperature=0,
     http_client=_http_client,
 )
