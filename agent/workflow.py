@@ -100,7 +100,7 @@ def azure_Call(state: AgentState):
         ]
 
         response = llm.invoke(prompt_messages)
-        print(f"Input: {response.usage_metadata['input_tokens']} | Output: {response.usage_metadata['output_tokens']} | Total: {response.usage_metadata['total_tokens']}")
+        print(response)
         return {
             "messages": deletes + [response],
             "summary": new_summary,
@@ -121,7 +121,7 @@ def azure_Call(state: AgentState):
     prompt_messages.extend(messages)
 
     response = llm.invoke(prompt_messages)
-    print(f"Input: {response.usage_metadata['input_tokens']} | Output: {response.usage_metadata['output_tokens']} | Total: {response.usage_metadata['total_tokens']}")
+    print(response)
     return {
         "messages": [response],
         "summary": summary,
